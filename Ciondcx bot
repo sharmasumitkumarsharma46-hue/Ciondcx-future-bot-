@@ -1,0 +1,213 @@
+import requests, time, datetime, hmac, hashlib, json, pandas as pd
+from ta.trend import EMAIndicator, MACD
+from ta.momentum import RSIIndicator
+from ta.volatility import AverageTrueRange
+import os
+
+# ===== CONFIG =====
+symbol = "BTCUSDT"
+timeframe = "5m"
+leverage = 20
+base_url = "https://api.coindcx.com"
+
+# ===== FEES SETTINGS =====
+maker_fee = 0.001     # 0.1% per side
+taker_fee = 0.001     # 0.1% per side
+
+# ===== API KEYS (for live mode only) =====
+api_key = "YOUR_API_KEY"
+secret_key = "YOUR_SECRET_KEY"
+
+# ===== MODE (MANUAL) =====
+mode = "paper"   # "paper" for demo | "live" for real trading
+
+# ===== CSV FILE PATH (Permanent Storage on Render Disk) =====
+log_folder = "/data"  # Persistent disk mount path on Render
+os.makedirs(log_folder, exist_ok=True)
+log_file = os.path.join(log_folder, "bot_log.csv")
+
+print(f"\n🚀 CoinDCX Futures Bot Started ({mode.upper()} MODE)\n")
+print(f"📂 Log file: {log_file}")
+
+# ===== SIGNATURE FUNCTION =====
+def sign_payload(body: dict):
+    payload = json.dumps(body, separators=(",", ":"))
+    signature = hmac.new(secret_key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return signature, payload
+
+# ===== FETCH BALANCE =====
+def get_balance():
+    try:
+        ts = int(time.time() * 1000)
+        body = {"timestamp": ts}
+        signature, payload = sign_payload(body)
+        headers = {
+            "Content-Type": "application/json",
+            "X-AUTH-APIKEY": api_key,
+            "X-AUTH-SIGNATURE": signature
+        }
+        res = requests.post(f"{base_url}/exchange/v1/users/balances", headers=headers, data=payload, timeout=10)
+        balances = res.json()
+        for b in balances:
+            if b["currency"] == "USDT":
+                return float(b["balance"])
+        return 0.0
+    except Exception as e:
+        print("⚠️ Balance fetch error:", e)
+        return 0.0
+
+# ===== FETCH MARKET DATA =====
+def fetch_data():
+    try:
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={timeframe}&limit=120"
+        res = requests.get(url, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        df = pd.DataFrame(data, columns=[
+            "time","open","high","low","close","volume",
+            "close_time","quote_vol","ntrades","tb_base","tb_quote","ignore"])
+        df = df[["time","open","high","low","close","volume"]].astype(float)
+        df["EMA20"] = EMAIndicator(df["close"], 20).ema_indicator()
+        df["EMA50"] = EMAIndicator(df["close"], 50).ema_indicator()
+        df["RSI"] = RSIIndicator(df["close"], 14).rsi()
+        macd = MACD(df["close"])
+        df["MACD_hist"] = macd.macd_diff()
+        df["ATR"] = AverageTrueRange(df["high"], df["low"], df["close"], 14).average_true_range()
+        return df
+    except Exception as e:
+        print("⚠️ Data fetch error:", e)
+        return None
+
+# ===== SIGNAL GENERATOR =====
+def signal_generator(df):
+    if df is None or df.empty or len(df) < 2:
+        return "HOLD"
+    last, prev = df.iloc[-1], df.iloc[-2]
+    if last["EMA20"] > last["EMA50"] and last["RSI"] > 55 and last["MACD_hist"] > prev["MACD_hist"]:
+        return "BUY"
+    elif last["EMA20"] < last["EMA50"] and last["RSI"] < 45 and last["MACD_hist"] < prev["MACD_hist"]:
+        return "SELL"
+    return "HOLD"
+
+# ===== LIVE PRICE =====
+def live_price():
+    try:
+        r = requests.get(f"{base_url}/exchange/ticker", timeout=10)
+        for item in r.json():
+            if item["market"] == symbol:
+                return float(item["last_price"])
+    except Exception as e:
+        print("⚠️ Price error:", e)
+    return None
+
+# ===== LOGGING =====
+# Create header if file doesn't exist
+if not os.path.exists(log_file):
+    with open(log_file, "w") as f:
+        f.write("timestamp,price,signal,balance,profit\n")
+
+def log_signal(timestamp, price, signal, balance, profit=0.0):
+    try:
+        with open(log_file, "a") as f:
+            f.write(f"{timestamp},{price},{signal},{balance},{profit}\n")
+    except Exception as e:
+        print("⚠️ Log error:", e)
+
+# ===== TRADE SYSTEM =====
+virtual_balance = 1000.0
+position = None
+entry_price = 0.0
+
+def execute_trade(signal, price):
+    global position, entry_price, virtual_balance
+
+    if price is None:
+        return
+
+    # === Compound System ===
+    if mode == "paper":
+        amount_usd = virtual_balance
+    else:
+        current_balance = get_balance()
+        amount_usd = current_balance * 0.99
+        print(f"💰 [LIVE] Current Balance: ${current_balance:.2f} | Using: ${amount_usd:.2f}")
+
+    # === BUY SIGNAL ===
+    if signal == "BUY" and position != "BUY":
+        entry_price = price
+        position = "BUY"
+        print(f"📈 {mode.upper()} BUY @ {price:.2f}")
+        log_signal(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), price, signal, virtual_balance)
+
+    # === SELL SIGNAL ===
+    elif signal == "SELL" and position == "BUY":
+        gross_profit = (price - entry_price) / entry_price * amount_usd * leverage
+        trade_fee = amount_usd * leverage * (maker_fee + taker_fee)
+        net_profit = gross_profit - trade_fee
+
+        if net_profit <= 0:
+            print(f"🚫 Trade skipped (fees > profit): {net_profit:.2f}")
+            log_signal(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), price, signal, virtual_balance, net_profit)
+            return
+
+        position = None
+
+        if mode == "paper":
+            virtual_balance += net_profit
+            print(f"📉 [PAPER] SELL @ {price:.2f} | Profit: ${net_profit:.2f} | New Balance: ${virtual_balance:.2f}")
+            log_signal(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), price, signal, virtual_balance, net_profit)
+        else:
+            print(f"💸 Estimated Fee: ${trade_fee:.2f} | Expected Net Profit: ${net_profit:.2f}")
+            try:
+                side = "sell"
+                quantity = round(amount_usd / price, 5)
+                body = {
+                    "side": side,
+                    "order_type": "market",
+                    "market": symbol,
+                    "total_quantity": quantity,
+                    "price_per_unit": 0,
+                    "leverage": leverage,
+                    "timestamp": int(time.time() * 1000)
+                }
+                signature, payload = sign_payload(body)
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-AUTH-APIKEY": api_key,
+                    "X-AUTH-SIGNATURE": signature
+                }
+                res = requests.post(f"{base_url}/exchange/v1/orders/create",
+                                    headers=headers, data=payload, timeout=10)
+                print(f"✅ [LIVE] SELL Order Sent | Response: {res.json()}")
+                final_balance = get_balance()
+                log_signal(datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), price, signal, final_balance, net_profit)
+            except Exception as e:
+                print("⚠️ Live SELL error:", e)
+
+# ===== MAIN LOOP =====
+last_signal = None
+while True:
+    try:
+        df = fetch_data()
+        signal = signal_generator(df)
+        price = live_price()
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if price:
+            print(f"[{now}] Price: {price:.2f} | Signal: {signal}")
+
+        if signal in ["BUY", "SELL"] and signal != last_signal:
+            execute_trade(signal, price)
+            last_signal = signal
+
+        # Log current balance
+        current_bal = get_balance() if mode == "live" else virtual_balance
+        log_signal(now, price, signal, current_bal, 0)
+
+        time.sleep(300)  # Wait 5 min (one candle)
+    except KeyboardInterrupt:
+        print("\n🛑 Bot stopped manually.")
+        break
+    except Exception as e:
+        print("⚠️ Loop error:", e)
+        time.sleep(60)
